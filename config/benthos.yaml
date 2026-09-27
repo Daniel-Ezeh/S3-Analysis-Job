@@ -1,0 +1,39 @@
+http:
+  enabled: true
+  address: 0.0.0.0:4195
+  debug_endpoints: false
+
+logger:
+  level: ${BENTHOS_LOG_LEVEL:INFO}
+  static_fields:
+    service: s3-analysis-sqs-redpanda
+
+input:
+  aws_sqs:
+    url: ${SQS_URL}
+    region: ${AWS_REGION:us-east-1}
+    endpoint: ${SQS_ENDPOINT:}
+    credentials:
+      id: ${AWS_ACCESS_KEY_ID}
+      secret: ${AWS_SECRET_ACCESS_KEY}
+      token: ${AWS_SESSION_TOKEN:}
+    max_number_of_messages: ${SQS_MAX_MESSAGES:10}
+    wait_time_seconds: ${SQS_WAIT_TIME_SECONDS:20}
+    delete_message: true
+
+pipeline:
+  processors:
+    - mapping: |
+        root = this
+
+output:
+  kafka:
+    addresses:
+      - ${KAFKA_BROKERS:redpanda:9092}
+    topic: ${KAFKA_TOPIC:s3-object-metadata}
+    key: ${! json("key").or(counter()) }
+    max_in_flight: 64
+    batching:
+      count: ${KAFKA_BATCH_COUNT:1000}
+      byte_size: ${KAFKA_BATCH_BYTES:1048576}
+      period: ${KAFKA_BATCH_PERIOD:1s}

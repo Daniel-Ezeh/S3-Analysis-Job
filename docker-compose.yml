@@ -1,0 +1,207 @@
+name: s3-analysis-job
+
+networks:
+  pipeline:
+    driver: bridge
+
+volumes:
+  redpanda-data:
+  clickhouse-data:
+  clickhouse-logs:
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v25.3.6}
+    container_name: s3-analysis-redpanda
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=2
+      - --memory=2G
+      - --reserve-memory=512M
+      - --overprovisioned
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      - --pandaproxy-addr=internal://0.0.0.0:8082,external://0.0.0.0:18082
+      - --advertise-pandaproxy-addr=internal://redpanda:8082,external://localhost:18082
+      - --schema-registry-addr=internal://0.0.0.0:8081,external://0.0.0.0:18081
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "${REDPANDA_SCHEMA_REGISTRY_PORT:-18081}:18081"
+      - "${REDPANDA_PANDAPROXY_PORT:-18082}:18082"
+      - "${REDPANDA_KAFKA_PORT:-19092}:19092"
+      - "${REDPANDA_ADMIN_PORT:-19644}:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - pipeline
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:${REDPANDA_CONSOLE_VERSION:-v3.5.1}
+    container_name: s3-analysis-redpanda-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+        schemaRegistry:
+          enabled: true
+          urls: ["http://redpanda:8081"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - "${REDPANDA_CONSOLE_PORT:-9090}:8080"
+    networks:
+      - pipeline
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  create-topics:
+    image: docker.redpanda.com/redpandadata/redpanda:${REDPANDA_VERSION:-v25.3.6}
+    container_name: s3-analysis-create-topics
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        rpk topic create "$${KAFKA_TOPIC}" --brokers redpanda:9092 --partitions "$${KAFKA_TOPIC_PARTITIONS}" --replicas 1 || true
+        rpk topic create "$${KAFKA_INVALID_TOPIC}" --brokers redpanda:9092 --partitions "$${KAFKA_INVALID_TOPIC_PARTITIONS}" --replicas 1 || true
+    environment:
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-s3-object-metadata}
+      KAFKA_INVALID_TOPIC: ${KAFKA_INVALID_TOPIC:-s3-object-metadata-invalid}
+      KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-12}
+      KAFKA_INVALID_TOPIC_PARTITIONS: ${KAFKA_INVALID_TOPIC_PARTITIONS:-3}
+    networks:
+      - pipeline
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.8}
+    container_name: s3-analysis-clickhouse
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    networks:
+      - pipeline
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  benthos:
+    image: docker.redpanda.com/redpandadata/connect:${REDPANDA_CONNECT_VERSION:-latest}
+    command: ["run", "/benthos.yaml"]
+    restart: unless-stopped
+    volumes:
+      - ./config/benthos.yaml:/benthos.yaml:ro
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      SQS_URL: ${SQS_URL:?Set SQS_URL in .env}
+      SQS_ENDPOINT: ${SQS_ENDPOINT:-}
+      SQS_MAX_MESSAGES: ${SQS_MAX_MESSAGES:-10}
+      SQS_WAIT_TIME_SECONDS: ${SQS_WAIT_TIME_SECONDS:-20}
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-s3-object-metadata}
+    expose:
+      - "4195"
+    networks:
+      - pipeline
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      create-topics:
+        condition: service_completed_successfully
+
+  s3-analysis-consumer:
+    build:
+      context: ./services/s3-analysis-consumer
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-s3-object-metadata}
+      KAFKA_INVALID_TOPIC: ${KAFKA_INVALID_TOPIC:-s3-object-metadata-invalid}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-s3-analysis-consumer}
+      KAFKA_AUTO_OFFSET_RESET: ${KAFKA_AUTO_OFFSET_RESET:-earliest}
+      CONSUMER_BATCH_SIZE: ${CONSUMER_BATCH_SIZE:-10000}
+      CONSUMER_FLUSH_SECONDS: ${CONSUMER_FLUSH_SECONDS:-1}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-s3_object_metadata}
+    networks:
+      - pipeline
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+      create-topics:
+        condition: service_completed_successfully
+
+  s3-backfill-enqueue:
+    build:
+      context: ./backfill_enqueue
+    container_name: s3-analysis-backfill-enqueue
+    profiles:
+      - backfill
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:-}
+      AWS_RESPONSE_CHECKSUM_VALIDATION: ${AWS_RESPONSE_CHECKSUM_VALIDATION:-when_required}
+      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET in .env}
+      S3_PREFIX: ${S3_PREFIX:-}
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_FORCE_PATH_STYLE_URLS: ${S3_FORCE_PATH_STYLE_URLS:-false}
+      SQS_URL: ${SQS_URL:?Set SQS_URL in .env}
+      SQS_ENDPOINT: ${SQS_ENDPOINT:-}
+      BACKFILL_PAGE_SIZE: ${BACKFILL_PAGE_SIZE:-1000}
+      BACKFILL_BATCH_SIZE: ${BACKFILL_BATCH_SIZE:-10}
+      BACKFILL_WORKERS: ${BACKFILL_WORKERS:-8}
+      BACKFILL_LIMIT: ${BACKFILL_LIMIT:-0}
+      BACKFILL_SUFFIX: ${BACKFILL_SUFFIX:-}
+      BACKFILL_START_AFTER: ${BACKFILL_START_AFTER:-}
+      BACKFILL_DRY_RUN: ${BACKFILL_DRY_RUN:-false}
+      BACKFILL_PROGRESS_EVERY: ${BACKFILL_PROGRESS_EVERY:-10000}
+      SQS_FIFO_MESSAGE_GROUP_ID: ${SQS_FIFO_MESSAGE_GROUP_ID:-}
+    networks:
+      - pipeline
