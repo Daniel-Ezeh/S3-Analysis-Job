@@ -89,7 +89,7 @@ services:
         condition: service_healthy
 
   clickhouse:
-    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.8}
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-latest}
     container_name: s3-analysis-clickhouse
     restart: unless-stopped
     environment:
@@ -111,6 +111,41 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:${CLICKHOUSE_VERSION:-25.7}
+    container_name: s3-analysis-clickhouse-init
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        clickhouse-client \
+          --host clickhouse \
+          --port 9000 \
+          --user "$${CLICKHOUSE_USER}" \
+          --password "$${CLICKHOUSE_PASSWORD}" \
+          --query "CREATE DATABASE IF NOT EXISTS $${CLICKHOUSE_DATABASE}"
+        clickhouse-client \
+          --host clickhouse \
+          --port 9000 \
+          --user "$${CLICKHOUSE_USER}" \
+          --password "$${CLICKHOUSE_PASSWORD}" \
+          --database "$${CLICKHOUSE_DATABASE}" \
+          --multiquery < /sql/001_create_s3_object_metadata.sql
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - ./sql:/sql:ro
+    networks:
+      - pipeline
+    depends_on:
+      clickhouse:
+        condition: service_healthy
 
   benthos:
     image: docker.redpanda.com/redpandadata/connect:${REDPANDA_CONNECT_VERSION:-latest}
@@ -168,6 +203,8 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      clickhouse-init:
+        condition: service_completed_successfully
       redpanda:
         condition: service_healthy
       create-topics:
@@ -177,8 +214,6 @@ services:
     build:
       context: ./backfill_enqueue
     container_name: s3-analysis-backfill-enqueue
-    profiles:
-      - backfill
     env_file:
       - path: .env
         required: false
@@ -199,6 +234,8 @@ services:
       BACKFILL_WORKERS: ${BACKFILL_WORKERS:-8}
       BACKFILL_LIMIT: ${BACKFILL_LIMIT:-0}
       BACKFILL_SUFFIX: ${BACKFILL_SUFFIX:-}
+      BACKFILL_START_DATE: ${BACKFILL_START_DATE:-}
+      BACKFILL_END_DATE: ${BACKFILL_END_DATE:-}
       BACKFILL_START_AFTER: ${BACKFILL_START_AFTER:-}
       BACKFILL_DRY_RUN: ${BACKFILL_DRY_RUN:-false}
       BACKFILL_PROGRESS_EVERY: ${BACKFILL_PROGRESS_EVERY:-10000}

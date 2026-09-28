@@ -7,10 +7,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from pathlib import PurePosixPath
 from typing import Any
 
 import boto3
@@ -29,6 +31,15 @@ def positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return parsed
+
+
+def parse_date(value: str) -> date:
+    for fmt in ("%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError("must be in dd-mm-yyyy or yyyy-mm-dd format")
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=int(env("BACKFILL_LIMIT", "0") or "0"))
     parser.add_argument("--start-after", default=env("BACKFILL_START_AFTER"))
     parser.add_argument("--suffix", default=env("BACKFILL_SUFFIX", ""))
+    parser.add_argument("--start-date", type=parse_date, default=env("BACKFILL_START_DATE"))
+    parser.add_argument("--end-date", type=parse_date, default=env("BACKFILL_END_DATE"))
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -60,7 +73,40 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.batch_size > 10:
         parser.error("--batch-size cannot exceed 10 because SQS SendMessageBatch allows 10")
+    if args.start_date and args.end_date and args.start_date > args.end_date:
+        parser.error("--start-date cannot be after --end-date")
     return args
+
+
+DATE_PREFIX_RE = re.compile(r"^(?P<day>\d{2})-(?P<month>\d{2})-(?P<year>\d{4})")
+
+
+def date_from_key(key: str) -> date | None:
+    filename = PurePosixPath(key).name
+    match = DATE_PREFIX_RE.match(filename)
+    if not match:
+        return None
+    try:
+        return date(
+            int(match.group("year")),
+            int(match.group("month")),
+            int(match.group("day")),
+        )
+    except ValueError:
+        return None
+
+
+def date_in_range(key: str, start_date: date | None, end_date: date | None) -> bool:
+    if not start_date and not end_date:
+        return True
+    parsed = date_from_key(key)
+    if parsed is None:
+        return False
+    if start_date and parsed < start_date:
+        return False
+    if end_date and parsed > end_date:
+        return False
+    return True
 
 
 def client_config(force_path_style: bool) -> Config:
@@ -81,8 +127,7 @@ def make_message(bucket: str, obj: dict[str, Any]) -> str:
         "bucket": bucket,
         "key": obj["Key"],
         "size": obj.get("Size", 0),
-        "etag": obj.get("ETag", "").strip('"'),
-        "last_modified": obj.get("LastModified"),
+        "updated_at": obj.get("LastModified"),
     }
     return json.dumps(body, default=json_default, separators=(",", ":"))
 
@@ -91,8 +136,8 @@ def entry_id(seed: str) -> str:
     return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:32]
 
 
-def dedup_id(bucket: str, key: str, etag: str) -> str:
-    seed = f"{bucket}\n{key}\n{etag}"
+def dedup_id(bucket: str, key: str, updated_at: Any) -> str:
+    seed = f"{bucket}\n{key}\n{updated_at}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()
 
 
@@ -144,7 +189,11 @@ def main() -> int:
     started = time.monotonic()
     queue_is_fifo = args.queue_url.endswith(".fifo")
 
-    print(f"Starting metadata backfill bucket={args.bucket!r} prefix={args.prefix!r} dry_run={args.dry_run}", flush=True)
+    print(
+        f"Starting metadata backfill bucket={args.bucket!r} prefix={args.prefix!r} "
+        f"start_date={args.start_date} end_date={args.end_date} dry_run={args.dry_run}",
+        flush=True,
+    )
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         for page in s3.get_paginator("list_objects_v2").paginate(**paginate_args):
@@ -152,6 +201,9 @@ def main() -> int:
                 scanned += 1
                 key = obj["Key"]
                 if args.suffix and not key.endswith(args.suffix):
+                    skipped += 1
+                    continue
+                if not date_in_range(key, args.start_date, args.end_date):
                     skipped += 1
                     continue
 
@@ -162,7 +214,7 @@ def main() -> int:
                 }
                 if queue_is_fifo:
                     message["MessageGroupId"] = args.fifo_message_group_id or "s3-analysis"
-                    message["MessageDeduplicationId"] = dedup_id(args.bucket, key, obj.get("ETag", ""))
+                    message["MessageDeduplicationId"] = dedup_id(args.bucket, key, obj.get("LastModified", ""))
 
                 batch.append(message)
                 if len(batch) == args.batch_size:

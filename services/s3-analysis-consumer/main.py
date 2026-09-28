@@ -86,7 +86,19 @@ def build_clickhouse_client():
     )
 
 
-def parse_metadata(payload: dict[str, Any]) -> tuple[str, datetime, str, str, int]:
+def parse_datetime(value: Any, field_name: str) -> datetime:
+    if not value:
+        raise ValueError(f"missing {field_name}")
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_metadata(payload: dict[str, Any]) -> tuple[str, datetime, str, datetime, int]:
     key = str(payload.get("key", ""))
     match = KEY_RE.match(key)
     if not match:
@@ -102,20 +114,18 @@ def parse_metadata(payload: dict[str, Any]) -> tuple[str, datetime, str, str, in
         tzinfo=timezone.utc,
     )
 
-    etag = str(payload.get("etag", "")).strip('"')
-    if not etag:
-        raise ValueError("missing etag")
+    updated_at = parse_datetime(payload.get("updated_at") or payload.get("last_modified"), "updated_at")
 
     return (
         match.group("device_id"),
         timestamp,
         match.group("message_id"),
-        etag,
+        updated_at,
         int(payload.get("size", 0) or 0),
     )
 
 
-def parse_message(msg) -> tuple[tuple[str, datetime, str, str, int] | None, dict[str, Any] | None]:
+def parse_message(msg) -> tuple[tuple[str, datetime, str, datetime, int] | None, dict[str, Any] | None]:
     raw = msg.value()
     if raw is None:
         return None, {"error": "empty message", "payload": None}
@@ -133,10 +143,10 @@ def parse_message(msg) -> tuple[tuple[str, datetime, str, str, int] | None, dict
         return None, {"error": str(exc), "payload": payload}
 
 
-def row_from_parsed(parsed: tuple[str, datetime, str, str, int]) -> tuple[str, str, datetime, str, str, int]:
-    device_id, timestamp, message_id, etag, size = parsed
-    row_id = str(uuid.uuid5(uuid.NAMESPACE_URL, etag))
-    return row_id, device_id, timestamp, message_id, etag, size
+def row_from_parsed(parsed: tuple[str, datetime, str, datetime, int]) -> tuple[str, str, datetime, str, datetime, int]:
+    device_id, timestamp, message_id, updated_at, size = parsed
+    row_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{device_id}/{timestamp.isoformat()}/{message_id}"))
+    return row_id, device_id, timestamp, message_id, updated_at, size
 
 
 def produce_invalid(producer: Producer, records: list[dict[str, Any]]) -> None:
@@ -147,13 +157,13 @@ def produce_invalid(producer: Producer, records: list[dict[str, Any]]) -> None:
     producer.flush()
 
 
-def insert_rows(client, rows: list[tuple[str, str, datetime, str, str, int]]) -> None:
+def insert_rows(client, rows: list[tuple[str, str, datetime, str, datetime, int]]) -> None:
     if not rows:
         return
     client.insert(
         CLICKHOUSE_TABLE,
         rows,
-        column_names=["id", "device_id", "timestamp", "message_id", "etag", "size"],
+        column_names=["id", "device_id", "timestamp", "message_id", "updated_at", "size"],
     )
 
 
@@ -164,7 +174,7 @@ def commit_batch(consumer: Consumer, messages: list[Any]) -> None:
 
 
 def process_batch(consumer: Consumer, producer: Producer, client, messages: list[Any]) -> tuple[int, int]:
-    rows: list[tuple[str, str, datetime, str, str, int]] = []
+    rows: list[tuple[str, str, datetime, str, datetime, int]] = []
     invalid: list[dict[str, Any]] = []
 
     for msg in messages:
