@@ -7,6 +7,6 @@ CREATE TABLE IF NOT EXISTS s3_object_metadata
     updated_at DateTime64(3, 'UTC'),
     size UInt64
 )
-ENGINE = ReplacingMergeTree(updated_at)
+ENGINE = ReplacingMergeTree(device_id,updated_at)
 PARTITION BY toYYYYMM(timestamp)
 ORDER BY (device_id, timestamp, message_id);
